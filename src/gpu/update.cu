@@ -1,6 +1,11 @@
 ﻿#include "gpu_api.h"
 #include "particle.hpp"
 #include <cuda_runtime.h>
+#include <thrust/device_ptr.h>
+#include <thrust/sort.h>
+#include <thrust/sequence.h>
+#include <curand_kernel.h>
+
 
 // simulation update kernel
 __global__

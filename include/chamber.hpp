@@ -13,7 +13,6 @@ public:
     float ymin() const;
     float ymax() const;
 
-    void enforceBounds(Particle& p) const;
     std::pair<int, int> cellIndex(float x, float y) const;
     std::pair<int, int> cellIndex(const Particle& p) const;
 

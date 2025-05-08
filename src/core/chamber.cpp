@@ -40,27 +40,6 @@ Chamber::Chamber(float xmin, float xmax,
     nCellsY_ = nY;
 }
 
-void Chamber::enforceBounds(Particle& p) const {
-    // X-axis reflection and clamp
-    if (p.x < xmin_) {
-        p.x = xmin_;
-        p.vx = -p.vx;
-    }
-    else if (p.x > xmax_) {
-        p.x = xmax_;
-        p.vx = -p.vx;
-    }
-
-    if (p.y < ymin_) {
-        p.y = ymin_;
-        p.vy = 0;
-    }
-    else if (p.y > ymax_) {
-        p.y = ymax_;
-        p.vy = -p.vy;
-    }
-}
-
 std::pair<int, int> Chamber::cellIndex(float x, float y) const {
     // shift into local chamber coords
     float fx = x - xmin_;
