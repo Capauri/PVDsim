@@ -58,7 +58,7 @@ void initRenderer(size_t totalParticles)
     );
 }
 
-void updateAndDraw(float         dt,
+void updateAndDraw(float dt,
     Particle* devParticleArray,
     size_t        totalParticles)
 {

@@ -7,7 +7,6 @@ void launchUpdate(
     float xmin, float xmax, float ymin, float ymax,
     int nCellsX, int nCellsY,
     float cellW, float cellH,
-    int* cellIndices,
     int* particleIndices,
     int* cellStart,
     int* cellEnd,
@@ -20,3 +19,4 @@ void initRNGStates(
     int nCells, 
     unsigned long seed
 );
+

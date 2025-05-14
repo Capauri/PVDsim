@@ -1,5 +1,6 @@
 ﻿#include <iostream>
 #include <vector>
+#include <ctime>
 #include <cuda_runtime.h>
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
@@ -23,37 +24,39 @@ static Particle* allocDev(size_t n, const Particle* host) {
     return devPtr;
 }
 
-extern "C" __global__ void initRNG(curandState* states, unsigned long seed);
-
 int main() {
     const int   N = 10000;
     const float dt = 0.001f;
+    const float dt_init = dt;
     const float cellSize = 0.01f;
     const float sigma = 1e-4f;
+    const float initSpeedMin = 0.5f;
+    const float initSpeedMax = 2.0f;
+    const float maxRelSpeed = 10.0f;
 
-    Chamber chamber(
+    Chamber chamber(-1.0f, 1.0f,
         -1.0f, 1.0f,
-        -1.0f, 1.0f,
-        cellSize
-    );
+        cellSize);
 
     int nCellsX = static_cast<int>((chamber.xmax() - chamber.xmin()) / cellSize);
     int nCellsY = static_cast<int>((chamber.ymax() - chamber.ymin()) / cellSize);
     int nCells = nCellsX * nCellsY;
-    float Vcell = cellSize * cellSize;   // 2D “volume” for DSMC
-    const float maxRelSpeed = 10.0f;      // estimate of max relative velocity
+    float Vcell = cellSize * cellSize;
 
     std::vector<Particle> hostP(N);
-    initParticles(hostP, chamber, /*vmin=*/1.0f, /*vmax=*/5.0f);
+    initParticles(hostP, chamber, initSpeedMin, initSpeedMax, dt_init);
 
     Particle* devP = allocDev(N, hostP.data());
     if (!devP) return -1;
 
-    curandState* d_randStates;
+    curandState* d_randStates = nullptr;
     cudaMalloc(&d_randStates, nCells * sizeof(curandState));
     initRNGStates(d_randStates, nCells, static_cast<unsigned long>(time(nullptr)));
 
-    int* d_cellIdx, * d_partIdx, * d_cellStart, * d_cellEnd;
+    int* d_cellIdx = nullptr;
+    int* d_partIdx = nullptr;
+    int* d_cellStart = nullptr;
+    int* d_cellEnd = nullptr;
     cudaMalloc(&d_cellIdx, N * sizeof(int));
     cudaMalloc(&d_partIdx, N * sizeof(int));
     cudaMalloc(&d_cellStart, nCells * sizeof(int));
@@ -89,15 +92,15 @@ int main() {
             chamber.xmin(), chamber.xmax(),
             chamber.ymin(), chamber.ymax(),
             nCellsX, nCellsY,
-            cellSize, cellSize,
-            d_cellIdx, d_partIdx,
+            cellSize, cellSize, 
+            d_partIdx,
             d_cellStart, d_cellEnd,
             d_randStates,
             sigma, Vcell, maxRelSpeed
         );
 
         glClear(GL_COLOR_BUFFER_BIT);
-        updateAndDraw(dt, devP, N);
+        updateAndDraw(dt, devP, static_cast<size_t>(N));
 
         glfwSwapBuffers(window);
         glfwPollEvents();
@@ -110,7 +113,6 @@ int main() {
     cudaFree(d_partIdx);
     cudaFree(d_cellStart);
     cudaFree(d_cellEnd);
-
     glfwDestroyWindow(window);
     glfwTerminate();
     return 0;
