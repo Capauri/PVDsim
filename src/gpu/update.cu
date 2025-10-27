@@ -1,153 +1,135 @@
-﻿#include "particle.hpp"
+﻿#include <cuda_runtime.h>
 #include <curand_kernel.h>
-#include <cuda_runtime.h>
-#include <cmath>
+#include "particle.hpp"
 
 __global__
-void rngInitKernel(curandState* states, int nCells, unsigned long seed) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= nCells) return;
-    curand_init(seed, idx, 0, &states[idx]);
-}
-
-void initRNGStates(curandState* states, int nCells, unsigned long seed) {
-    int threads = 256;
-    int blocks = (nCells + threads - 1) / threads;
-    rngInitKernel << <blocks, threads >> > (states, nCells, seed);
-    cudaDeviceSynchronize();
-}
-
-__global__
-void collideDSMC(
+void updateKernel(
     Particle* ps,
-    int* particleIndices,
-    int* cellStart,
-    int* cellEnd,
-    curandState* states,
-    float        dt,
-    float        sigma,
-    float        Vcell,
-    float        maxRelSpeed
+    int n,
+    float dt,
+    float gravity,
+    float ymin
 ) {
-    int cell = blockIdx.x;
-    int start = cellStart[cell];
-    int end = cellEnd[cell];
-    int Nc = end - start;
-    if (Nc < 2) return;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
 
-    int nPairs = int(0.5f * Nc * (Nc - 1) * sigma * dt / Vcell + 0.5f);
-    curandState& st = states[cell];
+    Particle& p = ps[i];
 
-    for (int i = 0; i < nPairs; ++i) {
-        int a = start + (curand(&st) % Nc);
-        int b = start + (curand(&st) % Nc);
-        if (a == b) continue;
+    float vx = p.x - p.x_prev;
+    float vy = p.y - p.y_prev;
+    float vz = p.z - p.z_prev;
 
-        int ia = particleIndices[a];
-        int ib = particleIndices[b];
+    float ax = 0.f;
+    float ay = (p.type == SPECIES_ARGON) ? 0.f : -gravity;
+    float az = 0.f;
 
-        float vx1 = (ps[ia].x - ps[ia].x_prev) / dt;
-        float vy1 = (ps[ia].y - ps[ia].y_prev) / dt;
-        float vx2 = (ps[ib].x - ps[ib].x_prev) / dt;
-        float vy2 = (ps[ib].y - ps[ib].y_prev) / dt;
-
-        float2 dv = { vx1 - vx2, vy1 - vy2 };
-        float  rel = sqrtf(dv.x * dv.x + dv.y * dv.y);
-
-        if (curand_uniform(&st) * maxRelSpeed < rel) {
-            float phi = 2.f * 3.141592653589793f * curand_uniform(&st);
-            float2 gnew = { rel * cosf(phi), rel * sinf(phi) };
-            float2 vcm = { 0.5f * (vx1 + vx2), 0.5f * (vy1 + vy2) };
-
-
-            float newVx1 = vcm.x + 0.5f * gnew.x;
-            float newVy1 = vcm.y + 0.5f * gnew.y;
-            float newVx2 = vcm.x - 0.5f * gnew.x;
-            float newVy2 = vcm.y - 0.5f * gnew.y;
-
-            // encode them back into x_prev
-            ps[ia].x_prev = ps[ia].x - newVx1 * dt;
-            ps[ia].y_prev = ps[ia].y - newVy1 * dt;
-            ps[ib].x_prev = ps[ib].x - newVx2 * dt;
-            ps[ib].y_prev = ps[ib].y - newVy2 * dt;
-        }
-    }
-}
-
-__global__
-void verletKernel(
-    Particle* ps,
-    int       N,
-    float     dt,
-    float     xmin, float xmax,
-    float     ymin, float ymax
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= N) return;
-
-    float x = ps[idx].x;
-    float xp = ps[idx].x_prev;
-    float y = ps[idx].y;
-    float yp = ps[idx].y_prev;
-
-    if (y == ymin && yp == ymin) {
-        return;
-    }
-
-    float x_new = 2 * x - xp;
-    float y_new = 2 * y - yp;
+    float x_new = 2.f * p.x - p.x_prev + ax * dt * dt;
+    float y_new = 2.f * p.y - p.y_prev + ay * dt * dt;
+    float z_new = 2.f * p.z - p.z_prev + az * dt * dt;
 
     if (y_new <= ymin) {
-        float freezeX = x;
-        ps[idx].x = freezeX;
-        ps[idx].x_prev = freezeX;
-        ps[idx].y = ymin;
-        ps[idx].y_prev = ymin;
-        return;
+        y_new = ymin;
+        x_new = p.x;
+        z_new = p.z;
     }
 
-    ps[idx].x_prev = x;
-    ps[idx].y_prev = y;
-    ps[idx].x = x_new;
-    ps[idx].y = y_new;
+    p.x_prev = p.x;
+    p.y_prev = p.y;
+    p.z_prev = p.z;
+
+    p.x = x_new;
+    p.y = y_new;
+    p.z = z_new;
 }
+
 
 void launchUpdate(
     Particle* devPs,
-    int          n,
-    float        dt,
-    float        xmin, float xmax,
-    float        ymin, float ymax,
-    int          nCellsX, int nCellsY,
-    float        cellW, float cellH,
-    int* particleIndices,
-    int* cellStart,
-    int* cellEnd,
-    curandState* randStates,
-    float        sigma,
-    float        Vcell,
-    float        maxRelSpeed
+    int n,
+    float dt,
+    float gravity,
+    float ymin
 ) {
-    int numCells = nCellsX * nCellsY;
-    collideDSMC << <numCells, 1 >> > (
-        devPs,
-        particleIndices,
-        cellStart,
-        cellEnd,
-        randStates,
-        dt,
-        sigma,
-        Vcell,
-        maxRelSpeed
-        );
-
     int threads = 256;
     int blocks = (n + threads - 1) / threads;
-    verletKernel << <blocks, threads >> > (
-        devPs, n, dt,
+    updateKernel << <blocks, threads >> > (devPs, n, dt, gravity, ymin);
+    cudaDeviceSynchronize();
+}
+__global__
+void injectArKernel(
+    Particle* pOut,
+    int       N_emit,
+    float     xmin,
+    float     xmax,
+    float     zmin,
+    float     zmax,
+    float     y_fixed,
+    float     vy_down
+) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i >= N_emit) return;
+
+    curandState rng;
+    curand_init(clock64(), i, 0, &rng);
+
+    float x = xmin + (xmax - xmin) * curand_uniform(&rng);
+    float z = zmin + (zmax - zmin) * curand_uniform(&rng);
+    float vy = vy_down;
+
+    Particle p;
+    p.x = x;
+    p.y = y_fixed;
+    p.z = z;
+    p.x_prev = x;
+    p.y_prev = y_fixed - vy * 0.01f;
+    p.z_prev = z;
+    p.type = SPECIES_ARGON;
+
+    pOut[i] = p;
+}
+
+void launchInjectArIons(
+    Particle* devOut,
+    int       N_emit,
+    float     xmin, float xmax,
+    float     zmin, float zmax,
+    float     y_fixed,
+    float     vy_down
+) {
+    int threads = 128;
+    int blocks = (N_emit + threads - 1) / threads;
+
+    injectArKernel << <blocks, threads >> > (
+        devOut, N_emit,
         xmin, xmax,
-        ymin, ymax
+        zmin, zmax,
+        y_fixed, vy_down
         );
 
     cudaDeviceSynchronize();
+}
+
+__global__
+void countArgon(Particle* ps, int n, int* outCount) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    if (ps[i].type == SPECIES_ARGON) {
+        atomicAdd(outCount, 1);
+    }
+}
+
+void debugCountArgon(Particle* devPs, int n) {
+    int* devCount;
+    int hostCount = 0;
+    cudaMalloc(&devCount, sizeof(int));
+    cudaMemcpy(devCount, &hostCount, sizeof(int), cudaMemcpyHostToDevice);
+
+    int threads = 128;
+    int blocks = (n + threads - 1) / threads;
+    countArgon << <blocks, threads >> > (devPs, n, devCount);
+
+    cudaMemcpy(&hostCount, devCount, sizeof(int), cudaMemcpyDeviceToHost);
+    cudaFree(devCount);
+
 }

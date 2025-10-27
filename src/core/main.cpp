@@ -1,67 +1,70 @@
 ﻿#include <iostream>
 #include <vector>
-#include <ctime>
+#include <algorithm>
+#include <random>
+
 #include <cuda_runtime.h>
 #include <glad/glad.h>
+#define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
-#include <curand_kernel.h>
-#include "chamber.hpp"
+
 #include "particle.hpp"
-#include "gpu_api.h"
+#include "chamber.hpp"
+#include "chamber_device.cuh"
+#include "update.cuh"
 #include "renderer.hpp"
 
+// Allocate device buffer and copy host particles to GPU
 static Particle* allocDev(size_t n, const Particle* host) {
     Particle* devPtr = nullptr;
-    if (cudaMalloc(&devPtr, n * sizeof(Particle)) != cudaSuccess) {
-        std::cerr << "cudaMalloc failed\n";
-        return nullptr;
-    }
-    if (cudaMemcpy(devPtr, host, n * sizeof(Particle), cudaMemcpyHostToDevice) != cudaSuccess) {
-        std::cerr << "cudaMemcpy to device failed\n";
-        cudaFree(devPtr);
-        return nullptr;
-    }
+    cudaMalloc(&devPtr, n * sizeof(Particle));
+    cudaMemcpy(devPtr, host, n * sizeof(Particle), cudaMemcpyHostToDevice);
     return devPtr;
 }
 
 int main() {
-    const int   N = 10000;
-    const float dt = 0.001f;
-    const float dt_init = dt;
-    const float cellSize = 0.01f;
-    const float sigma = 1e-4f;
-    const float initSpeedMin = 0.5f;
-    const float initSpeedMax = 2.0f;
-    const float maxRelSpeed = 10.0f;
+    const int N = 1000;
+    const float B = 1.0f;        // Cube bounds: [-B, B]^3
+    const float dt = 0.01f;
+    const float gravity = -0.5f;
+    const float ymin = -B;
 
-    Chamber chamber(-1.0f, 1.0f,
-        -1.0f, 1.0f,
-        cellSize);
+    // Injection parameters
+    const int N_max = 10000;
+    const float sourceXmin = -0.5f, sourceXmax = 0.5f;
+    const float sourceZmin = -0.5f, sourceZmax = 0.5f;
+    const float sourceY = 1.0f;    // top of chamber
+    const float flux = 1e19f;      // atoms/m^2/s (real units)
+    const float ionEnergy_eV = 500.0f;
+    const float m_Ar = 6.63e-26f;
+    const float e_J = ionEnergy_eV * 1.602e-19f;
+    const float ionSpeed = std::sqrt(2.0f * e_J / m_Ar);
+    const float vy_down = -0.5f;
 
-    int nCellsX = static_cast<int>((chamber.xmax() - chamber.xmin()) / cellSize);
-    int nCellsY = static_cast<int>((chamber.ymax() - chamber.ymin()) / cellSize);
-    int nCells = nCellsX * nCellsY;
-    float Vcell = cellSize * cellSize;
+    // Macro-particle weight: 1 sim-particle = 1e15 real atoms
+    const float macroWeight = 1e15f;
 
+    // 1) Initialize particles in cube with downward velocity
     std::vector<Particle> hostP(N);
-    initParticles(hostP, chamber, initSpeedMin, initSpeedMax, dt_init);
+    std::mt19937 rng{ std::random_device{}() };
+    std::uniform_real_distribution<float> dist(-B, B);
+    for (auto& p : hostP) {
+        p.x = dist(rng);
+        p.y = dist(rng);
+        p.z = dist(rng);
+        float vy = -2.0f;
+        p.x_prev = p.x;
+        p.y_prev = p.y - vy * dt;
+        p.z_prev = p.z;
+    }
 
-    Particle* devP = allocDev(N, hostP.data());
-    if (!devP) return -1;
+    // 2) Copy to GPU (with padding)
+    std::vector<Particle> paddedHostP(N_max);
+    std::copy(hostP.begin(), hostP.end(), paddedHostP.begin());
+    Particle* devP = allocDev(N_max, paddedHostP.data());
+    int currentCount = N;
 
-    curandState* d_randStates = nullptr;
-    cudaMalloc(&d_randStates, nCells * sizeof(curandState));
-    initRNGStates(d_randStates, nCells, static_cast<unsigned long>(time(nullptr)));
-
-    int* d_cellIdx = nullptr;
-    int* d_partIdx = nullptr;
-    int* d_cellStart = nullptr;
-    int* d_cellEnd = nullptr;
-    cudaMalloc(&d_cellIdx, N * sizeof(int));
-    cudaMalloc(&d_partIdx, N * sizeof(int));
-    cudaMalloc(&d_cellStart, nCells * sizeof(int));
-    cudaMalloc(&d_cellEnd, nCells * sizeof(int));
-
+    // 3) Initialize GLFW / OpenGL
     if (!glfwInit()) {
         std::cerr << "glfwInit failed\n";
         return -1;
@@ -70,13 +73,14 @@ int main() {
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 5);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 
-    GLFWwindow* window = glfwCreateWindow(800, 600, "PVDsim", nullptr, nullptr);
+    GLFWwindow* window = glfwCreateWindow(800, 600, "PVDsim 3D", nullptr, nullptr);
     if (!window) {
         std::cerr << "glfwCreateWindow failed\n";
         glfwTerminate();
         return -1;
     }
     glfwMakeContextCurrent(window);
+
     if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) {
         std::cerr << "gladLoadGLLoader failed\n";
         glfwDestroyWindow(window);
@@ -84,35 +88,55 @@ int main() {
         return -1;
     }
 
-    initRenderer(N);
+    int width, height;
+    glfwGetFramebufferSize(window, &width, &height);
+    glViewport(0, 0, width, height);
+    glfwSetFramebufferSizeCallback(window, [](GLFWwindow* win, int w, int h) {
+        glViewport(0, 0, w, h);
+        });
 
+    // 5) Enable depth test and point size
+    glEnable(GL_DEPTH_TEST);
+    glEnable(GL_PROGRAM_POINT_SIZE);
+
+    // 6) Initialize renderer with max capacity
+    initRenderer(N_max);
+
+    // 7) Main loop
+    std::cout << "Entering render loop…\n";
     while (!glfwWindowShouldClose(window)) {
-        launchUpdate(
-            devP, N, dt,
-            chamber.xmin(), chamber.xmax(),
-            chamber.ymin(), chamber.ymax(),
-            nCellsX, nCellsY,
-            cellSize, cellSize, 
-            d_partIdx,
-            d_cellStart, d_cellEnd,
-            d_randStates,
-            sigma, Vcell, maxRelSpeed
-        );
+        float sourceArea = (sourceXmax - sourceXmin) * (sourceZmax - sourceZmin);
+        int N_emit = static_cast<int>(flux * sourceArea * dt / macroWeight);
+        N_emit = std::min(N_emit, N_max - currentCount);
 
-        glClear(GL_COLOR_BUFFER_BIT);
-        updateAndDraw(dt, devP, static_cast<size_t>(N));
+        if (N_emit > 0) {
+            launchInjectArIons(
+                devP + currentCount,
+                N_emit,
+                sourceXmin, sourceXmax,
+                sourceZmin, sourceZmax,
+                sourceY,
+                vy_down
+            );
+            currentCount += N_emit;
+        }
+
+        // Update particles on GPU
+        launchUpdate(devP, currentCount, dt, gravity, ymin);
+
+        // Render
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        updateAndDraw(0.0f, devP, static_cast<size_t>(currentCount));
 
         glfwSwapBuffers(window);
         glfwPollEvents();
+
+        debugCountArgon(devP, currentCount);
     }
 
+    // Cleanup
     cleanupRenderer();
     cudaFree(devP);
-    cudaFree(d_randStates);
-    cudaFree(d_cellIdx);
-    cudaFree(d_partIdx);
-    cudaFree(d_cellStart);
-    cudaFree(d_cellEnd);
     glfwDestroyWindow(window);
     glfwTerminate();
     return 0;

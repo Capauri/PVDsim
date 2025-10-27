@@ -11,6 +11,8 @@ void initParticles(std::vector<Particle>& hostP,
 {
     std::mt19937 rng{ std::random_device{}() };
     std::uniform_real_distribution<float> posX(chamber.xmin(), chamber.xmax());
+    std::uniform_real_distribution<float> posZ(chamber.zmin(), chamber.zmax());
+    std::uniform_real_distribution<float> azimuthDist(0.f, 2.f * 3.141592653589793f);
     std::uniform_real_distribution<float> speedDist(initSpeedMin, initSpeedMax);
     const float deg = 15.f * 3.141592653589793f / 180.f;
     std::uniform_real_distribution<float> angDist(
@@ -21,13 +23,19 @@ void initParticles(std::vector<Particle>& hostP,
     for (auto& p : hostP) {
         p.x = posX(rng);
         p.y = chamber.ymax();
+        p.z = posZ(rng);
 
+        float azimuth = azimuthDist(rng);
         float speed = speedDist(rng);
         float phi = angDist(rng);
-        float vx = speed * std::cos(phi);
+
+        float horiz = speed * std::cos(phi);
+        float vx = horiz * std::cos(azimuth);
         float vy = speed * std::sin(phi);
+        float vz = horiz * std::sin(azimuth);
 
         p.x_prev = p.x - vx * dt_init;
         p.y_prev = p.y - vy * dt_init;
+        p.z_prev = p.z - vz * dt_init;
     }
 }
